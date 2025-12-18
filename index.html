@@ -1,0 +1,737 @@
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>星际战机：光年突击</title>
+    <style>
+        /* 1. 基础样式与全屏设置 */
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #000;
+            overflow: hidden; /* 禁止滚动 */
+            touch-action: none; /* 禁止浏览器默认触摸行为 */
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+        canvas {
+            display: block;
+        }
+        /* 简单的UI覆盖层样式 - 实际大部分UI在Canvas中绘制，这里用于隐藏字体加载延迟 */
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-size: 24px;
+        }
+    </style>
+</head>
+<body>
+
+<div id="loading">资源加载中...</div>
+<canvas id="gameCanvas"></canvas>
+
+<script>
+/**
+ * 游戏核心逻辑
+ * 包含：渲染引擎、状态机、实体管理、存档系统、音频合成
+ */
+
+// --- 0. 配置与常量 ---
+const CONFIG = {
+    colors: {
+        primary: '#00f3ff', // 科技蓝
+        enemy: '#ff2a2a',   // 敌军红
+        gold: '#ffd700',    // 金币黄
+        text: '#ffffff',
+        boss: '#ff00ff'     // Boss紫
+    },
+    saveKey: 'galaxy_shooter_v1_save'
+};
+
+// --- 1. 音频系统 (Web Audio API 合成，无需外部文件) ---
+const AudioSys = {
+    ctx: null,
+    init: function() {
+        if (!this.ctx) {
+            this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+    },
+    playTone: function(freq, type, duration, vol=0.1) {
+        if (!this.ctx) return;
+        const osc = this.ctx.createOscillator();
+        const gain = this.ctx.createGain();
+        osc.type = type;
+        osc.frequency.setValueAtTime(freq, this.ctx.currentTime);
+        // 音量包络
+        gain.gain.setValueAtTime(vol, this.ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + duration);
+        
+        osc.connect(gain);
+        gain.connect(this.ctx.destination);
+        osc.start();
+        osc.stop(this.ctx.currentTime + duration);
+    },
+    playShoot: function() { this.playTone(800, 'square', 0.1, 0.05); },
+    playEnemyExplosion: function() { this.playTone(100, 'sawtooth', 0.3, 0.1); },
+    playPlayerExplosion: function() { this.playTone(50, 'sawtooth', 0.8, 0.2); },
+    playCollect: function() { this.playTone(1200, 'sine', 0.1, 0.1); },
+    playUI: function() { this.playTone(600, 'sine', 0.05, 0.05); }
+};
+
+// --- 2. 存档与数据系统 ---
+const GameData = {
+    money: 0,
+    unlockedPlanes: [0], // 默认解锁ID 0
+    upgrades: {
+        damage: 0, // 等级
+        health: 0,
+        speed: 0
+    },
+    highScore: 0,
+    loginDays: 1,
+    lastLogin: 0,
+    
+    // 飞机定义库
+    planes: [
+        { id: 0, name: "均衡型-猎鹰", price: 0, speed: 5, hp: 100, damage: 10, color: '#00f3ff', desc: "各项性能均衡，适合新手。" },
+        { id: 1, name: "速度型-闪电", price: 1000, speed: 8, hp: 70, damage: 8, color: '#ffff00', desc: "极高的机动性，但防御较低。" },
+        { id: 2, name: "火力型-重锤", price: 2500, speed: 3, hp: 150, damage: 20, color: '#ff4400', desc: "移动缓慢，但火力凶猛。" },
+        { id: 3, name: "狙击型-幽灵", price: 5000, speed: 6, hp: 80, damage: 35, color: '#bd00ff', desc: "低射速，极高单发伤害，穿透。" },
+        { id: 4, name: "堡垒型-泰坦", price: 10000, speed: 12, hp: 800, damage: 150, color: '#00ff44', desc: "空中坦克，拥有极高耐久。" }
+    ],
+
+    save: function() {
+        localStorage.setItem(CONFIG.saveKey, JSON.stringify({
+            money: this.money,
+            unlockedPlanes: this.unlockedPlanes,
+            upgrades: this.upgrades,
+            highScore: this.highScore,
+            loginDays: this.loginDays,
+            lastLogin: this.lastLogin
+        }));
+    },
+    
+    load: function() {
+        const str = localStorage.getItem(CONFIG.saveKey);
+        if (str) {
+            const data = JSON.parse(str);
+            this.money = data.money || 0;
+            this.unlockedPlanes = data.unlockedPlanes || [0];
+            this.upgrades = data.upgrades || { damage: 0, health: 0, speed: 0 };
+            this.highScore = data.highScore || 0;
+            this.loginDays = data.loginDays || 1;
+            this.lastLogin = data.lastLogin || 0;
+        }
+        this.checkDailyLogin();
+    },
+
+    checkDailyLogin: function() {
+        const now = new Date().toDateString();
+        if (this.lastLogin !== now) {
+            this.money += 100 * this.loginDays; // 每日奖励
+            this.loginDays++;
+            this.lastLogin = now;
+            this.save();
+            return true; // 触发了新登录
+        }
+        return false;
+    },
+
+    getStat: function(base, type) {
+        // 计算升级后的属性 (基础 + 等级 * 加成)
+        const mult = type === 'damage' ? 2 : type === 'health' ? 10 : 0.5;
+        return base + (this.upgrades[type] * mult);
+    }
+};
+
+// --- 3. 图形绘制工具 (Canvas 绘图) ---
+const Draw = {
+    glow: function(ctx, color, blur=15) {
+        ctx.shadowBlur = blur;
+        ctx.shadowColor = color;
+    },
+    resetGlow: function(ctx) {
+        ctx.shadowBlur = 0;
+    },
+    // 绘制玩家飞机 (简单的矢量风格)
+    player: function(ctx, x, y, r, color) {
+        ctx.save();
+        this.glow(ctx, color);
+        ctx.fillStyle = color;
+        ctx.translate(x, y);
+        
+        ctx.beginPath();
+        ctx.moveTo(0, -r); // 机头
+        ctx.lineTo(r, r);  // 右翼
+        ctx.lineTo(0, r/2); // 尾部凹陷
+        ctx.lineTo(-r, r); // 左翼
+        ctx.closePath();
+        ctx.fill();
+        
+        // 引擎火焰
+        ctx.fillStyle = `rgba(255, 100, 0, ${0.5 + Math.random()*0.5})`;
+        ctx.beginPath();
+        ctx.moveTo(-r/2, r);
+        ctx.lineTo(0, r + r/2 + Math.random()*5);
+        ctx.lineTo(r/2, r);
+        ctx.fill();
+        
+        ctx.restore();
+    },
+    // 绘制敌机
+    enemy: function(ctx, x, y, r, type) {
+        ctx.save();
+        let color = type === 3 ? CONFIG.colors.boss : CONFIG.colors.enemy;
+        this.glow(ctx, color);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.translate(x, y);
+        
+        ctx.beginPath();
+        if (type === 3) { // Boss
+            ctx.rotate(Date.now() / 500);
+            ctx.rect(-r, -r, r*2, r*2);
+            ctx.moveTo(-r, -r); ctx.lineTo(r, r);
+            ctx.moveTo(r, -r); ctx.lineTo(-r, r);
+        } else {
+            ctx.rotate(Math.PI); // 敌机朝下
+            ctx.moveTo(0, -r);
+            ctx.lineTo(r, r);
+            ctx.lineTo(-r, r);
+            ctx.closePath();
+        }
+        ctx.stroke();
+        
+        // Boss 血条
+        if (type === 3) {
+            ctx.restore(); // 取消旋转
+            ctx.save();
+            ctx.translate(x, y);
+            ctx.fillStyle = 'red';
+            ctx.fillRect(-r, -r - 10, r*2, 5);
+            ctx.fillStyle = '#0f0';
+            // 需要外部传入当前血量百分比，这里简化为演示
+        }
+        
+        ctx.restore();
+    },
+    bullet: function(ctx, x, y, isPlayer) {
+        ctx.save();
+        ctx.fillStyle = isPlayer ? '#fff' : '#f00';
+        this.glow(ctx, isPlayer ? '#0ff' : '#f00', 5);
+        ctx.beginPath();
+        ctx.arc(x, y, isPlayer ? 3 : 4, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+    }
+};
+
+// --- 4. 游戏引擎类 ---
+class Game {
+    constructor() {
+        this.canvas = document.getElementById('gameCanvas');
+        this.ctx = this.canvas.getContext('2d');
+        this.resize();
+        
+        // 游戏状态: MENU, SELECT, SHOP, PLAY, GAMEOVER
+        this.state = 'MENU';
+        
+        // 输入状态
+        this.input = { x: 0, y: 0, isDown: false, tap: false };
+        
+        // 实体容器
+        this.player = null;
+        this.enemies = [];
+        this.bullets = [];
+        this.particles = [];
+        this.stars = [];
+        this.items = []; // 掉落物
+        
+        // 游戏变量
+        this.score = 0;
+        this.wave = 1;
+        this.selectedPlaneId = 0;
+        this.skillCharge = 0; // 技能蓄力
+        
+        // 初始化
+        window.addEventListener('resize', () => this.resize());
+        this.setupInput();
+        this.initStars();
+        GameData.load();
+        
+        // 启动循环
+        this.loop = this.loop.bind(this);
+        requestAnimationFrame(this.loop);
+        
+        // 隐藏Loading
+        document.getElementById('loading').style.display = 'none';
+    }
+
+    resize() {
+        this.canvas.width = window.innerWidth;
+        this.canvas.height = window.innerHeight;
+    }
+
+    setupInput() {
+        const onDown = (e) => {
+            this.input.isDown = true;
+            this.input.tap = true;
+            AudioSys.init(); // 触发音频上下文
+            this.updateInputPos(e);
+        };
+        const onMove = (e) => {
+            if (this.input.isDown) this.updateInputPos(e);
+        };
+        const onUp = () => this.input.isDown = false;
+
+        this.canvas.addEventListener('mousedown', onDown);
+        this.canvas.addEventListener('mousemove', onMove);
+        window.addEventListener('mouseup', onUp);
+
+        this.canvas.addEventListener('touchstart', (e) => { e.preventDefault(); onDown(e.touches[0]); }, {passive: false});
+        this.canvas.addEventListener('touchmove', (e) => { e.preventDefault(); onMove(e.touches[0]); }, {passive: false});
+        window.addEventListener('touchend', onUp);
+    }
+
+    updateInputPos(e) {
+        this.input.x = e.clientX;
+        this.input.y = e.clientY;
+    }
+
+    initStars() {
+        for(let i=0; i<100; i++) {
+            this.stars.push({
+                x: Math.random() * this.canvas.width,
+                y: Math.random() * this.canvas.height,
+                size: Math.random() * 2,
+                speed: 0.5 + Math.random() * 2
+            });
+        }
+    }
+
+    // --- 核心循环 ---
+    loop() {
+        // 清除画布
+        this.ctx.fillStyle = '#000011';
+        this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+        
+        // 绘制背景
+        this.updateStars();
+        
+        // 状态机
+        switch(this.state) {
+            case 'MENU': this.updateMenu(); break;
+            case 'SELECT': this.updateSelect(); break;
+            case 'SHOP': this.updateShop(); break;
+            case 'PLAY': this.updatePlay(); break;
+            case 'GAMEOVER': this.updateGameOver(); break;
+        }
+        
+        this.input.tap = false; // 重置点击标志
+        requestAnimationFrame(this.loop);
+    }
+
+    updateStars() {
+        this.ctx.fillStyle = '#fff';
+        this.stars.forEach(s => {
+            s.y += s.speed * (this.state === 'PLAY' ? 1.5 : 0.5); // 游戏时加速
+            if (s.y > this.canvas.height) { s.y = 0; s.x = Math.random() * this.canvas.width; }
+            this.ctx.globalAlpha = Math.random() * 0.5 + 0.3;
+            this.ctx.beginPath();
+            this.ctx.arc(s.x, s.y, s.size, 0, Math.PI*2);
+            this.ctx.fill();
+        });
+        this.ctx.globalAlpha = 1;
+    }
+
+    // --- 界面逻辑 ---
+    drawButton(text, x, y, w, h, color='#333') {
+        this.ctx.fillStyle = color;
+        this.ctx.strokeStyle = '#0ff';
+        this.ctx.lineWidth = 2;
+        this.ctx.fillRect(x - w/2, y - h/2, w, h);
+        this.ctx.strokeRect(x - w/2, y - h/2, w, h);
+        
+        this.ctx.fillStyle = '#fff';
+        this.ctx.font = '20px Arial';
+        this.ctx.textAlign = 'center';
+        this.ctx.textBaseline = 'middle';
+        this.ctx.fillText(text, x, y);
+        
+        // 点击检测
+        if (this.input.tap && 
+            this.input.x > x - w/2 && this.input.x < x + w/2 &&
+            this.input.y > y - h/2 && this.input.y < y + h/2) {
+            AudioSys.playUI();
+            return true;
+        }
+        return false;
+    }
+
+    updateMenu() {
+        this.ctx.fillStyle = CONFIG.colors.primary;
+        this.ctx.font = '40px Arial';
+        this.ctx.textAlign = 'center';
+        Draw.glow(this.ctx, CONFIG.colors.primary);
+        this.ctx.fillText("星际战机", this.canvas.width/2, this.canvas.height/3);
+        this.ctx.font = '20px Arial';
+        this.ctx.fillText("光年突击", this.canvas.width/2, this.canvas.height/3 + 40);
+        Draw.resetGlow(this.ctx);
+        
+        if (this.drawButton("开始出击", this.canvas.width/2, this.canvas.height/2, 200, 50, '#004400')) {
+            this.state = 'SELECT';
+        }
+        if (this.drawButton("军械库 (商店)", this.canvas.width/2, this.canvas.height/2 + 70, 200, 50)) {
+            this.state = 'SHOP';
+        }
+        
+        this.ctx.font = '16px Arial';
+        this.ctx.fillStyle = '#aaa';
+        this.ctx.fillText(`最高分: ${GameData.highScore}  金币: ${GameData.money}`, this.canvas.width/2, this.canvas.height - 50);
+    }
+
+    updateSelect() {
+        this.ctx.fillStyle = '#fff';
+        this.ctx.font = '30px Arial';
+        this.ctx.textAlign = 'center';
+        this.ctx.fillText("选择你的战机", this.canvas.width/2, 100);
+        
+        // 简单的左右切换逻辑
+        const plane = GameData.planes[this.selectedPlaneId];
+        const isUnlocked = GameData.unlockedPlanes.includes(this.selectedPlaneId);
+        
+        // 绘制当前飞机的预览
+        Draw.player(this.ctx, this.canvas.width/2, this.canvas.height/2 - 50, 40, isUnlocked ? plane.color : '#555');
+        
+        this.ctx.fillStyle = '#fff';
+        this.ctx.font = '24px Arial';
+        this.ctx.fillText(plane.name, this.canvas.width/2, this.canvas.height/2 + 20);
+        this.ctx.font = '16px Arial';
+        this.ctx.fillStyle = '#ccc';
+        this.ctx.fillText(plane.desc, this.canvas.width/2, this.canvas.height/2 + 50);
+        
+        // 左右按钮
+        if (this.drawButton("<", this.canvas.width/2 - 100, this.canvas.height/2, 50, 50) && this.selectedPlaneId > 0) {
+            this.selectedPlaneId--;
+        }
+        if (this.drawButton(">", this.canvas.width/2 + 100, this.canvas.height/2, 50, 50) && this.selectedPlaneId < GameData.planes.length - 1) {
+            this.selectedPlaneId++;
+        }
+        
+        // 状态按钮
+        if (isUnlocked) {
+            if (this.drawButton("出 击", this.canvas.width/2, this.canvas.height - 100, 200, 60, '#006600')) {
+                this.startGame();
+            }
+        } else {
+            if (this.drawButton(`购买 ($${plane.price})`, this.canvas.width/2, this.canvas.height - 100, 200, 60, '#660000')) {
+                if (GameData.money >= plane.price) {
+                    GameData.money -= plane.price;
+                    GameData.unlockedPlanes.push(this.selectedPlaneId);
+                    GameData.save();
+                    AudioSys.playCollect();
+                }
+            }
+        }
+        
+        if (this.drawButton("返回", 50, 40, 80, 40)) this.state = 'MENU';
+    }
+
+    updateShop() {
+        this.ctx.fillStyle = '#fff';
+        this.ctx.font = '30px Arial';
+        this.ctx.textAlign = 'center';
+        this.ctx.fillText(`军械库 - 金币: ${GameData.money}`, this.canvas.width/2, 60);
+
+        const upgrades = [
+            { id: 'damage', name: '武器强化', cost: 500 * (GameData.upgrades.damage + 1) },
+            { id: 'health', name: '装甲强化', cost: 500 * (GameData.upgrades.health + 1) },
+            { id: 'speed', name: '引擎强化', cost: 500 * (GameData.upgrades.speed + 1) }
+        ];
+
+        let startY = 150;
+        upgrades.forEach((u, index) => {
+            const y = startY + index * 80;
+            this.ctx.textAlign = 'left';
+            this.ctx.fillText(`${u.name} (Lv.${GameData.upgrades[u.id]})`, 50, y);
+            
+            if (this.drawButton(`升级 $${u.cost}`, this.canvas.width - 100, y, 150, 50)) {
+                if (GameData.money >= u.cost) {
+                    GameData.money -= u.cost;
+                    GameData.upgrades[u.id]++;
+                    GameData.save();
+                    AudioSys.playCollect();
+                }
+            }
+        });
+
+        if (this.drawButton("返回主菜单", this.canvas.width/2, this.canvas.height - 80, 200, 50)) this.state = 'MENU';
+    }
+
+    // --- 游戏内逻辑 ---
+    startGame() {
+        const pData = GameData.planes[this.selectedPlaneId];
+        this.player = {
+            x: this.canvas.width / 2,
+            y: this.canvas.height - 100,
+            hp: GameData.getStat(pData.hp, 'health'),
+            maxHp: GameData.getStat(pData.hp, 'health'),
+            speed: GameData.getStat(pData.speed, 'speed'), // 这里速度主要影响移动灵敏度或自动机动
+            damage: GameData.getStat(pData.damage, 'damage'),
+            color: pData.color,
+            radius: 20,
+            lastShot: 0,
+            fireRate: this.selectedPlaneId === 3 ? 800 : 150, // 狙击型射速慢
+            shield: 0
+        };
+        
+        this.enemies = [];
+        this.bullets = [];
+        this.particles = [];
+        this.items = [];
+        this.score = 0;
+        this.wave = 1;
+        this.skillCharge = 0;
+        this.state = 'PLAY';
+    }
+
+    spawnEnemy() {
+        // 简单的波次生成逻辑
+        if (Math.random() < 0.02 + (this.wave * 0.001)) {
+            const type = Math.random() < 0.8 ? 0 : Math.random() < 0.9 ? 1 : 2; // 0:Basic, 1:Fast, 2:Tank
+            const radius = type === 2 ? 30 : 15;
+            this.enemies.push({
+                x: Math.random() * (this.canvas.width - 40) + 20,
+                y: -50,
+                type: type,
+                hp: (type === 2 ? 50 : 10) + this.wave * 2,
+                radius: radius,
+                speed: (type === 1 ? 5 : 2) + this.wave * 0.1
+            });
+        }
+        
+        // Boss 生成
+        if (this.score > this.wave * 1000 && !this.enemies.find(e => e.type === 3)) {
+            this.wave++;
+            this.enemies.push({
+                x: this.canvas.width/2,
+                y: -100,
+                type: 3, // Boss
+                hp: 500 * this.wave,
+                radius: 60,
+                speed: 1,
+                vx: 2
+            });
+        }
+    }
+
+    updatePlay() {
+        // 1. 玩家移动 (跟随手指/鼠标，带平滑)
+        if (this.input.isDown) {
+            // 简单的线性插值平滑
+            this.player.x += (this.input.x - this.player.x) * 0.15;
+            this.player.y += (this.input.y - 50 - this.player.y) * 0.15; // 手指上方一点
+        }
+        
+        // 限制边界
+        this.player.x = Math.max(20, Math.min(this.canvas.width - 20, this.player.x));
+        this.player.y = Math.max(20, Math.min(this.canvas.height - 20, this.player.y));
+
+        // 2. 玩家射击
+        const now = Date.now();
+        if (now - this.player.lastShot > this.player.fireRate) {
+            this.bullets.push({x: this.player.x, y: this.player.y - 20, vy: -10, isPlayer: true, damage: this.player.damage});
+            AudioSys.playShoot();
+            this.player.lastShot = now;
+        }
+
+        // 3. 敌人逻辑
+        this.spawnEnemy();
+        this.enemies.forEach((e, idx) => {
+            if (e.type === 3) { // Boss 逻辑
+                e.y = Math.min(e.y + e.speed, 150);
+                e.x += e.vx;
+                if (e.x < 50 || e.x > this.canvas.width - 50) e.vx *= -1;
+                // Boss 射击
+                if (Math.random() < 0.05) {
+                    this.bullets.push({x: e.x, y: e.y + e.radius, vy: 5, isPlayer: false, damage: 10});
+                }
+            } else {
+                e.y += e.speed;
+            }
+            
+            // 碰撞检测：玩家撞击敌人
+            const dist = Math.hypot(e.x - this.player.x, e.y - this.player.y);
+            if (dist < e.radius + this.player.radius) {
+                this.player.hp -= 20;
+                e.hp = 0; // 自杀式攻击
+                this.createExplosion(e.x, e.y, 20, '#ff0000');
+                AudioSys.playEnemyExplosion();
+            }
+
+            if (e.y > this.canvas.height + 50 || e.hp <= 0) {
+                if (e.hp <= 0) {
+                    this.score += (e.type + 1) * 10;
+                    this.createExplosion(e.x, e.y, e.radius, '#ffaa00');
+                    AudioSys.playEnemyExplosion();
+                    // 掉落金币
+                    if (Math.random() < 0.3) {
+                        this.items.push({x: e.x, y: e.y, type: 'coin', r: 10});
+                    }
+                }
+                this.enemies.splice(idx, 1);
+            }
+        });
+
+        // 4. 子弹逻辑
+        this.bullets.forEach((b, bIdx) => {
+            b.y += b.vy;
+            
+            // 玩家子弹击中敌人
+            if (b.isPlayer) {
+                this.enemies.forEach(e => {
+                    if (Math.hypot(b.x - e.x, b.y - e.y) < e.radius) {
+                        e.hp -= b.damage;
+                        b.dead = true;
+                    }
+                });
+            } else {
+                // 敌军子弹击中玩家
+                if (Math.hypot(b.x - this.player.x, b.y - this.player.y) < this.player.radius) {
+                    this.player.hp -= b.damage;
+                    b.dead = true;
+                }
+            }
+
+            if (b.y < -50 || b.y > this.canvas.height + 50) b.dead = true;
+        });
+        this.bullets = this.bullets.filter(b => !b.dead);
+
+        // 5. 道具/掉落物
+        this.items.forEach((it, idx) => {
+            it.y += 2;
+            if (Math.hypot(it.x - this.player.x, it.y - this.player.y) < this.player.radius + 10) {
+                if (it.type === 'coin') {
+                    GameData.money += 1000;
+                    AudioSys.playCollect();
+                }
+                this.items.splice(idx, 1);
+            } else if (it.y > this.canvas.height) {
+                this.items.splice(idx, 1);
+            }
+        });
+
+        // 6. 粒子特效
+        this.updateParticles();
+
+        // 7. 渲染
+        this.drawGame();
+
+        // 8. 死亡检测
+        if (this.player.hp <= 0) {
+            AudioSys.playPlayerExplosion();
+            if (this.score > GameData.highScore) GameData.highScore = this.score;
+            GameData.save();
+            this.state = 'GAMEOVER';
+        }
+    }
+
+    createExplosion(x, y, size, color) {
+        for(let i=0; i<10; i++) {
+            this.particles.push({
+                x: x, y: y,
+                vx: (Math.random() - 0.5) * 10,
+                vy: (Math.random() - 0.5) * 10,
+                life: 1.0,
+                color: color,
+                size: Math.random() * size/2
+            });
+        }
+    }
+
+    updateParticles() {
+        this.particles.forEach((p, idx) => {
+            p.x += p.vx;
+            p.y += p.vy;
+            p.life -= 0.05;
+            if (p.life <= 0) this.particles.splice(idx, 1);
+        });
+    }
+
+    drawGame() {
+        // 绘制玩家
+        Draw.player(this.ctx, this.player.x, this.player.y, this.player.radius, this.player.color);
+        
+        // 绘制敌人
+        this.enemies.forEach(e => Draw.enemy(this.ctx, e.x, e.y, e.radius, e.type));
+        
+        // 绘制子弹
+        this.bullets.forEach(b => Draw.bullet(this.ctx, b.x, b.y, b.isPlayer));
+        
+        // 绘制道具
+        this.items.forEach(it => {
+            this.ctx.fillStyle = CONFIG.colors.gold;
+            this.ctx.beginPath();
+            this.ctx.arc(it.x, it.y, it.r, 0, Math.PI*2);
+            this.ctx.fill();
+            this.ctx.fillStyle = '#000';
+            this.ctx.fillText("$", it.x, it.y);
+        });
+
+        // 绘制粒子
+        this.particles.forEach(p => {
+            this.ctx.globalAlpha = p.life;
+            this.ctx.fillStyle = p.color;
+            this.ctx.beginPath();
+            this.ctx.arc(p.x, p.y, p.size, 0, Math.PI*2);
+            this.ctx.fill();
+        });
+        this.ctx.globalAlpha = 1;
+
+        // UI: 血条与分数
+        this.ctx.fillStyle = 'white';
+        this.ctx.font = '20px Arial';
+        this.ctx.textAlign = 'left';
+        this.ctx.fillText(`Score: ${this.score}`, 20, 30);
+        this.ctx.fillText(`Money: ${GameData.money}`, 20, 60);
+        
+        // 血条
+        const hpPct = Math.max(0, this.player.hp / this.player.maxHp);
+        this.ctx.fillStyle = 'red';
+        this.ctx.fillRect(20, 80, 200, 20);
+        this.ctx.fillStyle = '#0f0';
+        this.ctx.fillRect(20, 80, 200 * hpPct, 20);
+        this.ctx.strokeStyle = '#fff';
+        this.ctx.strokeRect(20, 80, 200, 20);
+    }
+
+    updateGameOver() {
+        this.ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+        
+        this.ctx.fillStyle = '#fff';
+        this.ctx.textAlign = 'center';
+        this.ctx.font = '40px Arial';
+        this.ctx.fillText("任务失败", this.canvas.width/2, this.canvas.height/3);
+        
+        this.ctx.font = '24px Arial';
+        this.ctx.fillText(`最终得分: ${this.score}`, this.canvas.width/2, this.canvas.height/3 + 50);
+        
+        if (this.drawButton("返回菜单", this.canvas.width/2, this.canvas.height/2 + 50, 200, 50)) {
+            this.state = 'MENU';
+        }
+    }
+}
+
+// 启动游戏
+window.onload = () => {
+    new Game();
+};
+
+</script>
+</body>
+</html>
